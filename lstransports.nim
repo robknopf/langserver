@@ -10,6 +10,21 @@ import
   ./[ls, utils],
   ./protocol/[enums, types]
 
+when defined(posix):
+  import std/posix
+
+proc blockSigchld*() =
+  ## call first in a thread that isn't chronos's: chronos waits for a child process
+  ## (waitForExit: nim check, nimsuggest) through a signalfd on SIGCHLD, which the kernel
+  ## only queues there if every thread blocks the signal. A thread that doesn't gets it
+  ## delivered instead, where its default action is to discard it: the wait never ends,
+  ## and the child stays a zombie
+  when defined(posix):
+    var mask, old: Sigset
+    discard sigemptyset(mask)
+    discard sigaddset(mask, SIGCHLD)
+    discard pthread_sigmask(SIG_BLOCK, mask, old)
+
 type
   LspClientResponse* = object
     jsonrpc*: JsonRPC2
@@ -169,6 +184,7 @@ proc processContentLength*(
 proc readLspStdin*(
     ctx: ptr ReadStdinContext
 ) {.thread, raises: [IOError, OSError, ValueError].} =
+  blockSigchld()
   let inputStream = newFileStream(stdin)
   while true:
     let str = processContentLength(inputStream) & CRLF
@@ -178,6 +194,7 @@ proc readLspStdin*(
     discard ctx.onMainReadSignal.waitSync()
 
 proc readMcpStdin*(ctx: ptr ReadStdinContext) {.thread, raises: [IOError, OSError].} =
+  blockSigchld()
   let inputStream = newFileStream(stdin)
   while true:
     let str = inputStream.readLine()
