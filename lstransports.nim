@@ -3,6 +3,20 @@ import chronicles, chronos
 import std/[syncio, os, json, strutils, strformat, streams, oids, sequtils, times]
 import ls, utils
 import protocol/types, chronos/threadsync
+when defined(posix):
+  import std/posix
+
+proc blockSigchld() =
+  ## call first in a thread that isn't chronos's: chronos waits for a child process
+  ## (waitForExit: nim check, nimsuggest) through a signalfd on SIGCHLD, which the kernel
+  ## only queues there if every thread blocks the signal. A thread that doesn't gets it
+  ## delivered instead, where its default action is to discard it: the wait never ends,
+  ## and the child stays a zombie
+  when defined(posix):
+    var mask, old: Sigset
+    discard sigemptyset(mask)
+    discard sigaddset(mask, SIGCHLD)
+    discard pthread_sigmask(SIG_BLOCK, mask, old)
 
 type
   LspClientResponse* = object
@@ -158,6 +172,7 @@ proc processContentLength*(
       error "Error reading content length", msg = ex.msg
 
 proc readLspStdin*(ctx: ptr ReadStdinContext) {.thread.} =
+  blockSigchld()
   let inputStream = newFileStream(stdin)
   while true:
     let str = processContentLength(inputStream) & CRLF
@@ -167,6 +182,7 @@ proc readLspStdin*(ctx: ptr ReadStdinContext) {.thread.} =
     discard ctx.onMainReadSignal.waitSync()
 
 proc readMcpStdin*(ctx: ptr ReadStdinContext) {.thread.} =
+  blockSigchld()
   let inputStream = newFileStream(stdin)
   while true:
     let str = inputStream.readLine()
