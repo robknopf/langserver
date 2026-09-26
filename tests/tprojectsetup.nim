@@ -1,18 +1,14 @@
-import ../[nimlangserver, ls, lstransports, utils]
-import ../protocol/[enums, types]
 import
-  std/
-    [
-      options, json, os, jsonutils, sequtils, strutils, sugar, strformat
-    ]
-import json_rpc/[rpcclient]
-import chronicles
-import lspsocketclient
-import testhelpers
-import unittest2
+  std/[options, json, os, sequtils, sugar, strformat],
+  json_rpc/[rpcclient],
+  unittest2,
+  ../[nimlangserver, ls, utils],
+  ../protocol/[types],
+  ./[lspsocketclient, testhelpers]
 
 suite "nimble setup":
-  let cmdParams = CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
   let ls = main(cmdParams) #we could accesss to the ls here to test against its state
   let client = newLspSocketClient()
   waitFor client.connect("localhost", cmdParams.port)
@@ -22,6 +18,9 @@ suite "nimble setup":
     "textDocument/publishDiagnostics", "$/progress",
   )
   let testProjectDir = absolutePath "tests" / "projects" / "testproject"
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
 
   test "should pick `testproject.nim` as the main file and provide suggestions":
     let entryPoint = testProjectDir / "src" / "testproject.nim"
@@ -34,9 +33,9 @@ suite "nimble setup":
           {"window": {"workDoneProgress": true}, "workspace": {"configuration": true}},
       }
     discard waitFor client.initialize(initParams)
-   
+
     check waitFor client.waitForNotificationMessage(
-      fmt"Nimsuggest initialized for {entryPoint}",
+      fmt"Nimsuggest initialized for {entryPoint}"
     )
 
     let completionParams =
@@ -44,7 +43,7 @@ suite "nimble setup":
         "position": {"line": 7, "character": 0},
         "textDocument": {"uri": pathToUri(entryPoint)},
       }
-    let ns = waitFor ls.projectFiles[entryPoint].ns
+    let ns = ls.projectFiles[entryPoint].ns
     client.notify(
       "textDocument/didOpen",
       %createDidOpenParams("projects/testproject/src/testproject.nim"),
@@ -77,8 +76,20 @@ suite "nimble setup":
 
     check ls.projectFiles.len == 1
 
+  test "getNimbleDumpInfo reports the project's name and srcDir and caches it":
+    let nimbleFile = testProjectDir / "testproject.nimble"
+    let info = waitFor ls.getNimbleDumpInfo(nimbleFile)
+    check info.name == "testproject"
+    check info.srcDir == "src"
+    check nimbleFile in ls.nimDumpCache
+
+    let cached = waitFor ls.getNimbleDumpInfo(nimbleFile)
+    check cached.name == info.name
+    check cached.srcDir == info.srcDir
+
 suite "Project Mapping":
-  let cmdParams = CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
   let ls = main(cmdParams) #we could accesss to the ls here to test against its state
   let client = newLspSocketClient()
   waitFor client.connect("localhost", cmdParams.port)
@@ -88,6 +99,9 @@ suite "Project Mapping":
     "textDocument/publishDiagnostics", "$/progress",
   )
   let projectsDir = absolutePath "tests" / "projects"
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
 
   test "should use projectMapping fileRegex to find project file":
     let initParams =
@@ -99,19 +113,18 @@ suite "Project Mapping":
       }
     discard waitFor client.initialize(initParams)
     let configurationParams =
-      @[NlsConfig(projectMapping: some @[NlsNimsuggestConfig(fileRegex: ".nonimble*")])]
+      @[NlsConfig(projectMapping: some @[NlsNimsuggestConfig(fileRegex: "nonimble*")])]
     let nonimbleProject = projectsDir / "nonimbleproject.nim"
-    ls.workspaceConfiguration.complete(%configurationParams)
+    ls.setWorkspaceConfiguration(%configurationParams)
 
-    let projectFile = waitFor getProjectFile(pathToUri(nonimbleProject), ls)
-    let matchingMsg =
-      fmt"RegEx matched `.nonimble*` for file `{nonimbleProject.pathToUri}`"
+    let projectFile = waitFor getProjectFile(nonimbleProject, ls)
+    let matchingMsg = fmt"RegEx matched `nonimble*` for file `{nonimbleProject}`"
 
     check waitFor client.waitForNotification(
       "window/showMessage",
       proc(json: JsonNode): bool =
         json["message"].getStr == matchingMsg,
     )
-    let expectedProjectFile = nonimbleProject.pathToUri
+    let expectedProjectFile = nonimbleProject
 
     check projectFile == expectedProjectFile

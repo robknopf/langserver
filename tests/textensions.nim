@@ -1,16 +1,15 @@
-import ../[nimlangserver, ls, lstransports, utils]
-import ../protocol/[enums, types]
 import
-  std/[options, json, os, jsonutils, sequtils, strutils, sugar, strformat]
-import json_rpc/[rpcclient]
-import chronicles
-import lspsocketclient
-import chronos/asyncproc
-import testhelpers
-import unittest2
+  std/[options, json, os, jsonutils, sequtils, strutils, strformat],
+  json_rpc/[rpcclient],
+  chronos/asyncproc,
+  unittest2,
+  ../protocol/[types],
+  ../[nimlangserver, ls, utils],
+  ./[testhelpers, lspsocketclient]
 
 suite "Nimlangserver extensions":
-  let cmdParams = CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
   let ls = main(cmdParams) #we could accesss to the ls here to test against its state
   let client = newLspSocketClient()
   waitFor client.connect("localhost", cmdParams.port)
@@ -18,6 +17,9 @@ suite "Nimlangserver extensions":
     "window/showMessage", "window/workDoneProgress/create", "workspace/configuration",
     "extension/statusUpdate", "textDocument/publishDiagnostics", "$/progress",
   )
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
 
   test "calling extension/suggest with restart in the project uri should restart nimsuggest":
     let initParams =
@@ -35,9 +37,9 @@ suite "Nimlangserver extensions":
     let helloWorldFile = "projects/hw/hw.nim"
     let hwAbsFile = uriToPath(helloWorldFile.fixtureUri())
     client.notify("textDocument/didOpen", %createDidOpenParams(helloWorldFile))
-    
+
     check waitFor client.waitForNotificationMessage(
-      fmt"Nimsuggest initialized for {hwAbsFile}",
+      fmt"Nimsuggest initialized for {hwAbsFile}"
     )
 
     client.notify(
@@ -73,6 +75,16 @@ suite "Nimlangserver extensions":
     check tasks[0].name == "helloWorld"
     check tasks[0].description == "hello world"
 
+  test "calling extension/runTask should run the task and return its output":
+    let runTaskParams = RunTaskParams(command: @["helloWorld"])
+    let runTaskRes = client
+      .call("extension/runTask", jsonutils.toJson(runTaskParams))
+      .waitFor()
+      .jsonTo(RunTaskResult)
+
+    check runTaskRes.command == @["helloWorld"]
+    check runTaskRes.output.anyIt(it.contains("hello world"))
+
   test "calling extension/listTests should return all existing tests":
     #We first need to initialize the nimble project
     let projectDir = getCurrentDir() / "tests" / "projects" / "testrunner"
@@ -89,10 +101,13 @@ suite "Nimlangserver extensions":
       }
     let initializeResult = waitFor client.initialize(initParams)
 
-    let listTestsParams = ListTestsParams(entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath)
-    let tests = client.call("extension/listTests", jsonutils.toJson(listTestsParams)).waitFor().jsonTo(
-        ListTestsResult, Joptions(allowMissingKeys: true)
-      )
+    let listTestsParams = ListTestsParams(
+      entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath
+    )
+    let tests = client
+      .call("extension/listTests", jsonutils.toJson(listTestsParams))
+      .waitFor()
+      .jsonTo(ListTestsResult, Joptions(allowMissingKeys: true))
     let testProjectInfo = tests.projectInfo
     check testProjectInfo.suites.len == 3
     check testProjectInfo.suites["Sample Tests"].tests.len == 1
@@ -110,10 +125,13 @@ suite "Nimlangserver extensions":
       }
     let initializeResult = waitFor client.initialize(initParams)
 
-    let runTestsParams = RunTestParams(entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath)
-    let runTestsRes = client.call("extension/runTests", jsonutils.toJson(runTestsParams)).waitFor().jsonTo(
-        RunTestProjectResult, Joptions(allowMissingKeys: true)
-      )
+    let runTestsParams = RunTestParams(
+      entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath
+    )
+    let runTestsRes = client
+      .call("extension/runTests", jsonutils.toJson(runTestsParams))
+      .waitFor()
+      .jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
     check runTestsRes.suites.len == 4
     check runTestsRes.suites[0].name == "Sample Tests"
     check runTestsRes.suites[0].tests == 1
@@ -133,10 +151,14 @@ suite "Nimlangserver extensions":
     let initializeResult = waitFor client.initialize(initParams)
 
     let suiteName = "Sample Suite"
-    let runTestsParams = RunTestParams(entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath, suiteName: some suiteName)
-    let runTestsRes = client.call("extension/runTests", jsonutils.toJson(runTestsParams)).waitFor().jsonTo(
-        RunTestProjectResult, Joptions(allowMissingKeys: true)
-      )
+    let runTestsParams = RunTestParams(
+      entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath,
+      suiteName: some suiteName,
+    )
+    let runTestsRes = client
+      .call("extension/runTests", jsonutils.toJson(runTestsParams))
+      .waitFor()
+      .jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
     check runTestsRes.suites.len == 1
     check runTestsRes.suites[0].name == suiteName
     check runTestsRes.suites[0].tests == 3
@@ -149,12 +171,18 @@ suite "Nimlangserver extensions":
         "capabilities":
           {"window": {"workDoneProgress": true}, "workspace": {"configuration": true}},
       }
-    
+
     let initializeResult = waitFor client.initialize(initParams)
 
     let testName = "Sample Test"
-    let runTestsParams = RunTestParams(entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath, testNames: some @[testName])
-    let runTestsRes = client.call("extension/runTests", jsonutils.toJson(runTestsParams)).waitFor().jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
+    let runTestsParams = RunTestParams(
+      entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath,
+      testNames: some @[testName],
+    )
+    let runTestsRes = client
+      .call("extension/runTests", jsonutils.toJson(runTestsParams))
+      .waitFor()
+      .jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
 
     check runTestsRes.suites.len == 1
     check runTestsRes.suites[0].tests == 1
@@ -171,8 +199,14 @@ suite "Nimlangserver extensions":
       let initializeResult = waitFor client.initialize(initParams)
 
       let testNames = @["Sample Test", "Sample Test 2"]
-      let runTestsParams = RunTestParams(entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath, testNames: some testNames)
-      let runTestsRes = client.call("extension/runTests", jsonutils.toJson(runTestsParams)).waitFor().jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
+      let runTestsParams = RunTestParams(
+        entryPoint: "tests/projects/testrunner/tests/sampletests.nim".absolutePath,
+        testNames: some testNames,
+      )
+      let runTestsRes = client
+        .call("extension/runTests", jsonutils.toJson(runTestsParams))
+        .waitFor()
+        .jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
 
     check runTestsRes.suites.len == 1
   #   check runTestsRes.suites[0].tests == 2
@@ -185,11 +219,16 @@ suite "Nimlangserver extensions":
         "capabilities":
           {"window": {"workDoneProgress": true}, "workspace": {"configuration": true}},
       }
-      
+
     let initializeResult = waitFor client.initialize(initParams)
 
-    let runTestsParams = RunTestParams(entryPoint: "tests/projects/testrunner/tests/failingtest.nim".absolutePath)
-    let runTestsRes = client.call("extension/runTests", jsonutils.toJson(runTestsParams)).waitFor().jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
+    let runTestsParams = RunTestParams(
+      entryPoint: "tests/projects/testrunner/tests/failingtest.nim".absolutePath
+    )
+    let runTestsRes = client
+      .call("extension/runTests", jsonutils.toJson(runTestsParams))
+      .waitFor()
+      .jsonTo(RunTestProjectResult, Joptions(allowMissingKeys: true))
 
     check runTestsRes.suites.len == 1
     check runTestsRes.suites[0].name == "Failing Tests"

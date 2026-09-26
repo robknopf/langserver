@@ -1,0 +1,77 @@
+{.push raises: [], gcsafe.}
+
+import
+  std/[strutils, strformat],
+  chronos,
+  chronos/asyncproc,
+  chronicles,
+  ./[suggestapi, utils]
+
+type TrackMode* = enum
+  tmDef = "def"
+  tmUsages = "usages"
+  tmDefUsages = "defusages"
+
+proc parseTrackOutput(raw: string): seq[Suggest] {.raises: [ValueError].} =
+  for line in raw.splitLines:
+    if line.len == 0 or line.startsWith("Hint:") or
+        not (line.startsWith("def\t") or line.startsWith("use\t")):
+      continue
+    let tokens = line.split('\t')
+    if tokens.len < 8:
+      continue
+    result.add Suggest(
+      section: parseEnum[IdeCmd]("ide" & capitalizeAscii(tokens[0])),
+      symkind: tokens[1],
+      qualifiedPath: parseQualifiedPath(tokens[2]),
+      forth: tokens[3],
+      filePath: tokens[4],
+      line: parseInt(tokens[5]),
+      column: parseInt(tokens[6]),
+    )
+
+proc track*(
+    projectFile, file: string,
+    line, col: int,
+    mode: TrackMode,
+    nimPath: string,
+    workingDir: string,
+    timeout = REQUEST_TIMEOUT,
+): Future[seq[Suggest]] {.async: (raises: [CancelledError, AsyncProcessError]).} =
+  let arg = fmt "--{$mode}:{file},{line},{col}"
+
+  debug "nim track", projectFile = projectFile, arg = arg
+
+  let process = await startProcess(
+    nimPath,
+    workingDir = workingDir,
+    arguments = @["track", projectFile, arg],
+    options = {UsePath},
+    stdoutHandle = AsyncProcess.Pipe,
+    stderrHandle = AsyncProcess.Pipe,
+  )
+
+  try:
+    let stdoutFuture = process.stdoutStream.read()
+    let stderrFuture = process.stderrStream.read()
+    let exitCode = await process.waitForExit(timeout.milliseconds)
+    let stdoutBytes = await stdoutFuture
+    var stderrStr = ""
+    try:
+      stderrStr = (await stderrFuture).toString
+    except AsyncStreamError:
+      discard
+    if "invalid command: track" in stderrStr:
+      warn "nim track not supported (requires nim >= 2.4)", nimPath = nimPath
+      return @[]
+    if exitCode != 0:
+      error "nim track failed",
+        exitCode = exitCode, projectFile = projectFile, arg = arg, error = stderrStr
+    result = parseTrackOutput(stdoutBytes.toString)
+  except CancelledError as e:
+    await shutdownChildProcess(process)
+    raise e
+  except AsyncProcessError, AsyncStreamError, ValueError:
+    let e = getCurrentException()
+    debug "nim track exception", error = e.msg, name = e.name
+    result = @[]

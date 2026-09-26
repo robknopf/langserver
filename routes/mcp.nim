@@ -1,7 +1,13 @@
+{.push raises: [], gcsafe.}
+
 import
   std/[os, sequtils, tables, json],
-  pkg/[chronos, json_rpc/server, chronicles, json_serialization],
-  ../[suggestapi, ls, utils],
+  chronos,
+  chronos/asyncproc,
+  json_rpc/[errors, server],
+  chronicles,
+  json_serialization,
+  ../[suggestapi, trackapi, ls, utils],
   ../protocol/types
 
 const McpProtocolVersion* = "2025-11-25"
@@ -161,11 +167,56 @@ proc nimCheckFile(): McpTool =
     ),
   )
 
+proc nimFindTypeDefinition(): McpTool =
+  McpTool(
+    name: "nimFindTypeDefinition",
+    title: "Find type definition in .nim files",
+    description:
+      "Find the type definition of the symbol under cursor in the current workspace.",
+    inputSchema: McpToolSchema(
+      `type`: "object",
+      properties: %*{
+        "path": {"type": "string"},
+        "line": {"type": "integer"},
+        "column": {"type": "integer"},
+      },
+      required: @["path", "line", "column"],
+    ),
+    outputSchema: McpToolSchema(
+      `type`: "object",
+      properties: %*{
+        "defs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"},
+              "line": {"type": "integer"},
+              "column": {"type": "integer"},
+              "name": {"type": "string"},
+              "type": {"type": "string"},
+              "kind": {"type": "string"},
+            },
+            "required": ["path", "line", "column", "name", "type", "kind"],
+          },
+        }
+      },
+      required: @["defs"],
+    ),
+  )
+
 # Tool calls
 
 proc callNimFindReferences(
     ls: LanguageServer, params: McpCallToolParams
-): Future[McpCallToolResult] {.async.} =
+): Future[McpCallToolResult] {.
+    async: (
+      raises: [
+        CancelledError, ValueError, OSError, IOError, RegexError, AsyncProcessError,
+        NimsuggestError,
+      ]
+    )
+.} =
   let
     arguments = params.arguments.get()
     path = arguments["path"].getStr().absolutePath
@@ -176,6 +227,43 @@ proc callNimFindReferences(
   if uri notin ls.openFiles:
     await ls.didOpenFile(
       TextDocumentItem(uri: uri, languageId: "nim", version: 0, text: readFile(path))
+    )
+
+  let config = ls.getWorkspaceConfiguration()
+
+  if config.useNimTrack.get(false):
+    let projectFile = await ls.openFiles[uri].waitProjectFile()
+    let timeout = config.timeout.get(REQUEST_TIMEOUT)
+    let workingDir = await ls.getWorkingDir(projectFile)
+    let nimPath = await ls.getNimPath(config, workingDir)
+    if nimPath.isNone:
+      return McpCallToolResult(
+        content: @[McpContentBlock(`type`: TextContent, text: "Nim not found")],
+        isError: true,
+      )
+    let refs = await track(
+      projectFile,
+      path,
+      line,
+      column,
+      tmUsages,
+      nimPath = nimPath.get,
+      workingDir = workingDir,
+      timeout = timeout,
+    )
+
+    var usageReferencesJson = newJArray()
+    for reference in refs:
+      usageReferencesJson.add %*{
+        "path": reference.filePath, "line": reference.line, "column": reference.column
+      }
+
+    let structuredContent = %*{"refs": usageReferencesJson}
+
+    return McpCallToolResult(
+      content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
+      structuredContent: some structuredContent,
+      isError: false,
     )
 
   let nimsuggest = await ls.tryGetNimsuggest(uri)
@@ -194,7 +282,7 @@ proc callNimFindReferences(
 
     McpCallToolResult(
       content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
-      structuredContent: structuredContent,
+      structuredContent: some structuredContent,
       isError: false,
     )
   else:
@@ -206,7 +294,11 @@ proc callNimFindReferences(
 
 proc callNimFindSymbols(
     ls: LanguageServer, params: McpCallToolParams
-): Future[McpCallToolResult] {.async.} =
+): Future[McpCallToolResult] {.
+    async: (
+      raises: [CancelledError, KeyError, OSError, IOError, RegexError, NimsuggestError]
+    )
+.} =
   if len(ls.projectFiles) == 0:
     return McpCallToolResult(
       content: @[
@@ -248,7 +340,7 @@ proc callNimFindSymbols(
 
     McpCallToolResult(
       content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
-      structuredContent: structuredContent,
+      structuredContent: some structuredContent,
       isError: false,
     )
   else:
@@ -260,7 +352,12 @@ proc callNimFindSymbols(
 
 proc callNimListSymbols(
     ls: LanguageServer, params: McpCallToolParams
-): Future[McpCallToolResult] {.async.} =
+): Future[McpCallToolResult] {.
+    async: (
+      raises:
+        [CancelledError, ValueError, OSError, IOError, RegexError, NimsuggestError]
+    )
+.} =
   let
     arguments = params.arguments.get()
     path = arguments["path"].getStr().absolutePath
@@ -290,7 +387,7 @@ proc callNimListSymbols(
 
     McpCallToolResult(
       content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
-      structuredContent: structuredContent,
+      structuredContent: some structuredContent,
       isError: false,
     )
   else:
@@ -302,7 +399,9 @@ proc callNimListSymbols(
 
 proc callNimCheckProject(
     ls: LanguageServer, params: McpCallToolParams
-): Future[McpCallToolResult] {.async.} =
+): Future[McpCallToolResult] {.
+    async: (raises: [CancelledError, OSError, IOError, RegexError, NimsuggestError])
+.} =
   if len(ls.projectFiles) == 0:
     return McpCallToolResult(
       content: @[
@@ -344,7 +443,7 @@ proc callNimCheckProject(
 
     McpCallToolResult(
       content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
-      structuredContent: structuredContent,
+      structuredContent: some structuredContent,
       isError: false,
     )
   else:
@@ -356,7 +455,12 @@ proc callNimCheckProject(
 
 proc callNimCheckFile(
     ls: LanguageServer, params: McpCallToolParams
-): Future[McpCallToolResult] {.async.} =
+): Future[McpCallToolResult] {.
+    async: (
+      raises:
+        [CancelledError, ValueError, OSError, IOError, RegexError, NimsuggestError]
+    )
+.} =
   let
     arguments = params.arguments.get()
     path = arguments["path"].getStr().absolutePath
@@ -393,7 +497,57 @@ proc callNimCheckFile(
 
     McpCallToolResult(
       content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
-      structuredContent: structuredContent,
+      structuredContent: some structuredContent,
+      isError: false,
+    )
+  else:
+    McpCallToolResult(
+      content:
+        @[McpContentBlock(`type`: TextContent, text: "Nimsuggest is unavailable")],
+      isError: true,
+    )
+
+proc callNimFindTypeDefinition(
+    ls: LanguageServer, params: McpCallToolParams
+): Future[McpCallToolResult] {.
+    async: (
+      raises:
+        [CancelledError, ValueError, OSError, IOError, RegexError, NimsuggestError]
+    )
+.} =
+  let
+    arguments = params.arguments.get()
+    path = arguments["path"].getStr().absolutePath
+    uri = path.pathToUri()
+    line = arguments["line"].getInt()
+    column = arguments["column"].getInt()
+
+  if uri notin ls.openFiles:
+    await ls.didOpenFile(
+      TextDocumentItem(uri: uri, languageId: "nim", version: 0, text: readFile(path))
+    )
+
+  let nimsuggest = await ls.tryGetNimsuggest(uri)
+
+  if nimsuggest.isSome:
+    let typeDefs = await nimsuggest.get.`type`(path, path, line, column)
+
+    var typeDefsJson = newJArray()
+    for td in typeDefs:
+      typeDefsJson.add %*{
+        "path": td.filePath,
+        "line": td.line,
+        "column": td.column,
+        "name": td.name,
+        "type": td.forth,
+        "kind": td.symkind[2 ..^ 1],
+      }
+
+    let structuredContent = %*{"defs": typeDefsJson}
+
+    McpCallToolResult(
+      content: @[McpContentBlock(`type`: TextContent, text: $structuredContent)],
+      structuredContent: some structuredContent,
       isError: false,
     )
   else:
@@ -406,7 +560,7 @@ proc callNimCheckFile(
 # Routes
 proc initialize*(
     p: tuple[ls: LanguageServer, onExit: OnExitCallback], params: McpInitializeParams
-): Future[McpInitializeResult] {.async.} =
+): Future[McpInitializeResult] {.async: (raises: [OSError]).} =
   debug "Initialize received..."
   p.ls.mcpInitializeParams = params
   p.ls.mcpClientCapabilities = params.capabilities
@@ -417,14 +571,19 @@ proc initialize*(
       McpInitializeParams_serverInfo(name: "nimlangserver", version: LSPVersion),
   )
   debug "Initialize completed. Trying to start nimsuggest instances"
-  let ls = p.ls
+
+  let
+    ls = p.ls
+    rootPath = getCurrentDir().pathToUri.uriToPath
+
   ls.mcpServerCapabilities = result.capabilities
-  let rootPath = getCurrentDir().pathToUri.uriToPath
-  await ls.initNimsuggestInstances(rootPath)
+  ls.nimsuggestInit = ls.initNimsuggestInstances(rootPath)
+  ls.initialized = true
 
 proc listTools*(
     ls: LanguageServer, params: McpListToolsParams
-): Future[McpListToolsResult] {.async.} =
+): Future[McpListToolsResult] {.async: (raises: [ApplicationError]).} =
+  ls.checkInitialized()
   debug "Call tool received..."
   McpListToolsResult(
     tools: @[
@@ -433,13 +592,25 @@ proc listTools*(
       nimListSymbols(),
       nimCheckProject(),
       nimCheckFile(),
+      nimFindTypeDefinition(),
     ]
   )
 
 proc callTool*(
     ls: LanguageServer, params: McpCallToolParams
-): Future[McpCallToolResult] {.async.} =
+): Future[McpCallToolResult] {.
+    async: (
+      raises: [
+        ApplicationError, CancelledError, ValueError, OSError, IOError, RegexError,
+        AsyncProcessError, NimsuggestError,
+      ]
+    )
+.} =
+  ls.checkInitialized()
   debug "Call tool received...", name = params.name
+
+  await ls.nimsuggestInit
+
   case params.name
   of "nimFindReferences":
     await callNimFindReferences(ls, params)
@@ -451,6 +622,8 @@ proc callTool*(
     await callNimCheckProject(ls, params)
   of "nimCheckFile":
     await callNimCheckFile(ls, params)
+  of "nimFindTypeDefinition":
+    await callNimFindTypeDefinition(ls, params)
   else:
     McpCallToolResult(
       content: @[McpContentBlock(`type`: TextContent, text: "Unknown tool")],
@@ -458,5 +631,8 @@ proc callTool*(
     )
 
 # Notifications
-proc initialized*(ls: LanguageServer, _: JsonNode) {.async.} =
+proc initialized*(
+    ls: LanguageServer, _: JsonNode
+) {.async: (raises: [ApplicationError]).} =
+  ls.checkInitialized()
   debug "Client initialized."

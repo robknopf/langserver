@@ -1,15 +1,14 @@
-import ../[nimlangserver, ls, lstransports, utils]
-import ../protocol/[enums, types]
 import
-  std/[options, json, os, jsonutils, sequtils, strutils, sugar, strformat]
-import json_rpc/[rpcclient]
-import chronicles
-import lspsocketclient
-import chronos/asyncproc
-import unittest2
+  std/[options, json, os, strformat],
+  json_rpc/[rpcclient],
+  unittest2,
+  ../[nimlangserver, ls, lstransports, utils],
+  ../protocol/[types],
+  ./[lspsocketclient, testhelpers]
 
 suite "Nimlangserver misc":
-  let cmdParams = CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
   let ls = main(cmdParams) #we could accesss to the ls here to test against its state
   let client = newLspSocketClient()
   waitFor client.connect("localhost", cmdParams.port)
@@ -17,6 +16,9 @@ suite "Nimlangserver misc":
     "window/showMessage", "window/workDoneProgress/create", "workspace/configuration",
     "extension/statusUpdate", "textDocument/publishDiagnostics", "$/progress",
   )
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
 
   test "after a period of inactivity, nimsuggest should be stopped":
     let initParams =
@@ -29,11 +31,10 @@ suite "Nimlangserver misc":
     let initializeResult = waitFor client.initialize(initParams)
     let nsTimeout = 1000
     let conf = NlsConfig(nimsuggestIdleTimeout: some nsTimeout)
-    ls.workspaceConfiguration.complete(% @[conf])
-    
-    let gConf = waitFor ls.workspaceConfiguration
+    ls.setWorkspaceConfiguration(% @[conf])
 
-    asyncSpawn ls.tickLs() #We need to tick the ls so it get rid of the inactive nimsuggests
+    asyncSpawn ls.tickLs()
+      #We need to tick the ls so it get rid of the inactive nimsuggests
 
     let helloWorldUri = fixtureUri("projects/hw/hw.nim")
     let helloWorldFile = "projects/hw/hw.nim"
@@ -41,9 +42,127 @@ suite "Nimlangserver misc":
     client.notify("textDocument/didOpen", %createDidOpenParams(helloWorldFile))
 
     check waitFor client.waitForNotificationMessage(
-      fmt"Nimsuggest initialized for {hwAbsFile}",
+      fmt"Nimsuggest initialized for {hwAbsFile}"
     )
-    
+
     check waitFor client.waitForNotificationMessage(
-      fmt"Nimsuggest for {hwAbsFile} was stopped because it was idle for too long",
+      fmt"Nimsuggest for {hwAbsFile} was stopped because it was idle for too long"
     )
+
+suite "Nimlangserver fail count":
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let ls = main(cmdParams)
+  let client = newLspSocketClient()
+  waitFor client.connect("localhost", cmdParams.port)
+  client.registerNotification(
+    "window/showMessage", "window/workDoneProgress/create", "workspace/configuration",
+    "extension/statusUpdate", "textDocument/publishDiagnostics", "$/progress",
+  )
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
+
+  test "fail count is reset when a nimsuggest starts successfully":
+    # ls.failTable only ever increments, so a project that crashes and
+    # recovers keeps ratcheting toward MaxFails in getNimsuggest, after which
+    # its requests are silently rerouted or dropped for the rest of the
+    # session. A successful start must clear the count.
+    let initParams =
+      LspInitializeParams %* {
+        "processId": %getCurrentProcessId(),
+        "rootUri": fixtureUri("projects/hw/"),
+        "capabilities":
+          {"window": {"workDoneProgress": true}, "workspace": {"configuration": true}},
+      }
+    discard waitFor client.initialize(initParams)
+    ls.setWorkspaceConfiguration(% @[NlsConfig()])
+
+    let helloWorldFile = "projects/hw/hw.nim"
+    let hwAbsFile = uriToPath(helloWorldFile.fixtureUri())
+    ls.failTable[hwAbsFile] = 5
+
+    client.notify("textDocument/didOpen", %createDidOpenParams(helloWorldFile))
+    check waitFor client.waitForNotificationMessage(
+      fmt"Nimsuggest initialized for {hwAbsFile}"
+    )
+
+    check hwAbsFile notin ls.failTable
+
+suite "Nimlangserver pending requests":
+  test "cancelled projectFile future does not escape addProjectFileToPendingRequest":
+    # Regression test for #419: addProjectFileToPendingRequest is asyncSpawn'd,
+    # so an escaping CancelledError (nimsuggest restart or $/cancelRequest
+    # cancelling the awaited projectFile future) is re-raised into the event
+    # loop, escapes runForever and hits main's `except Exception: quit(1)`.
+    # The spawned task must swallow cancellation instead of failing.
+    let ls = LanguageServer(serverMode: lsp, transportMode: socket)
+    let uri = "file:///tmp/tpending419.nim"
+    let projectFileFut =
+      Future[string].Raising([CancelledError, OSError, RegexError]).init("projectFile")
+    ls.openFiles[uri] = NlsFileInfo(projectFile: projectFileFut)
+    ls.pendingRequests[1'u] = PendingRequest(id: 1, name: "textDocument/definition")
+
+    let fut = ls.addProjectFileToPendingRequest(1'u, uri)
+    projectFileFut.cancelSoon()
+
+    check waitUntil(fut.finished)
+    check fut.completed
+
+suite "Nimlangserver idle nimsuggest cleanup":
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let ls = main(cmdParams)
+  let client = newLspSocketClient()
+  waitFor client.connect("localhost", cmdParams.port)
+  client.registerNotification(
+    "window/showMessage", "window/workDoneProgress/create", "workspace/configuration",
+    "extension/statusUpdate", "textDocument/publishDiagnostics", "$/progress",
+  )
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
+
+  test "idle nimsuggest is removed even when an open file was already evicted":
+    # Regression test for #420: a URI evicted from ls.openFiles while the
+    # nimsuggest still tracks it made removeIdleNimsuggests raise KeyError,
+    # skipping project.stop()/projectFiles.del so the project was re-selected
+    # for removal on every tick.
+    let initParams =
+      LspInitializeParams %* {
+        "processId": %getCurrentProcessId(),
+        "rootUri": fixtureUri("projects/hw/"),
+        "capabilities":
+          {"window": {"workDoneProgress": true}, "workspace": {"configuration": true}},
+      }
+    discard waitFor client.initialize(initParams)
+    let conf = NlsConfig(nimsuggestIdleTimeout: some 1000)
+    ls.setWorkspaceConfiguration(% @[conf])
+
+    let helloWorldFile = "projects/hw/hw.nim"
+    let hwAbsFile = uriToPath(helloWorldFile.fixtureUri())
+    client.notify("textDocument/didOpen", %createDidOpenParams(helloWorldFile))
+    check waitFor client.waitForNotificationMessage(
+      fmt"Nimsuggest initialized for {hwAbsFile}"
+    )
+    ls.openFiles.del(helloWorldFile.fixtureUri())
+
+    proc sweptAway(ls: LanguageServer, projectFile: string): bool =
+      waitFor ls.removeIdleNimsuggests()
+      projectFile notin ls.projectFiles
+
+    check waitUntil(ls.sweptAway(hwAbsFile), timeout = 30.seconds)
+
+suite "Nimlangserver transport teardown":
+  test "writeOutput drops writes after the stdio stream is torn down":
+    # Regression test for #418: an in-flight runRpc continuation resuming after
+    # onExit closed ls.outStream wrote to a closed FILE and SIGSEGV'd inside
+    # libc fwrite. Test approach: the real crash needs a stdio teardown racing
+    # an async write and cannot be reproduced in-process without taking the
+    # test runner down with it, so we exercise the guarded state instead —
+    # after onExit, outStream is nil and a late writeOutput must be a no-op
+    # (pre-fix this dereferences a nil stream and dies).
+    let ls = LanguageServer(serverMode: lsp, transportMode: stdio)
+    check ls.outStream.isNil
+    ls.writeOutput(%*{"jsonrpc": "2.0", "id": 1, "result": newJNull()})
+    check ls.outStream.isNil
