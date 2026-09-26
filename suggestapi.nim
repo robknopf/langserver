@@ -348,9 +348,10 @@ proc createNimsuggest*(
   result.ns = newFuture[NimSuggest]()
   result.errorCallback = some errorCallback
   let isNimble = root.endsWith(".nimble")
-  let isNimScript = root.endsWith(".nims") or isNimble
   var extraArgs = newSeq[string]()
-  if isNimScript:
+  # a .nims is NimScript to nimsuggest already (its system has the NimScript API):
+  # importing it again makes every NimScript proc ambiguous. A .nimble isn't
+  if isNimble:
     extraArgs.add("--import: system/nimscript")
   #Nimsuggest crashes when including the file. 
   if isNimble:

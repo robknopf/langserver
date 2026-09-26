@@ -75,9 +75,10 @@ proc parseCheckResults(lines: seq[string]): seq[CheckResult] =
 proc nimCheck*(filePath: string, nimPath: string): Future[seq[CheckResult]] {.async.} =
   debug "nimCheck", filePath = filePath, nimPath = nimPath
   let isNimble = filePath.endsWith(".nimble")
-  let isNimScript = filePath.endsWith(".nims") or isNimble
   var extraArgs = newSeq[string]()
-  if isNimScript:
+  # `nim check foo.nims` checks it as NimScript already (its system has the NimScript
+  # API): importing it again makes every NimScript proc ambiguous. A .nimble isn't
+  if isNimble:
     extraArgs.add("--import: system/nimscript")
   if isNimble:
     extraArgs.add("--include: " & getNimScriptAPITemplatePath())
